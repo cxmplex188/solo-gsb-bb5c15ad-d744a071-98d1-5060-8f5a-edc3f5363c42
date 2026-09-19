@@ -114,9 +114,62 @@ _SUB_COLUMNS = (
     "window_updated_at"
 )
 
+# Shared projection for reading a subscription's delivery-window columns.
+# Both the PUT (re-read after the write) and the GET paths SELECT these exact
+# columns through _window_row_to_policy, so write and read serialize one
+# identical, persisted configuration.
+_WINDOW_COLUMNS = (
+    "window_timezone, window_weekdays, window_local_start, "
+    "window_local_end, window_updated_at"
+)
+
+
+def _window_row_to_policy(row) -> dict:
+    """Map the _WINDOW_COLUMNS projection of one subscription row to the
+    canonical delivery-window policy dict shared by reads and writes.
+
+    A row whose window columns are all NULL (never configured) maps to
+    configured=False with None fields; callers handle a missing row
+    (subscription id does not exist) by returning None themselves.
+    """
+    if row["window_timezone"] is None:
+        return {
+            "configured": False,
+            "timezone": None,
+            "weekdays": None,
+            "local_start": None,
+            "local_end": None,
+            "updated_at": None,
+        }
+    return {
+        "configured": True,
+        "timezone": row["window_timezone"],
+        "weekdays": json.loads(row["window_weekdays"]),
+        "local_start": row["window_local_start"],
+        "local_end": row["window_local_end"],
+        "updated_at": row["window_updated_at"],
+    }
+
 # Token accounting tolerance; avoids rescheduling by microseconds due to
 # floating-point round-off when a token is effectively already available.
 _TOKEN_EPS = 1e-9
+
+# Length of every subscription id; the same generator is the single source of
+# truth for creation, lookup and every delivery-window/rate-policy/topic path,
+# so the id POST /subscriptions hands out is exactly the key those later
+# writes and reads look up (no trimming, case folding or other reshaping).
+_SUBSCRIPTION_ID_LEN = 12
+
+
+def new_subscription_id() -> str:
+    """Mint a fresh subscription id (12 lowercase hex chars, unique primary key).
+
+    Always returns a plain ``str`` of exactly ``_SUBSCRIPTION_ID_LEN``
+    characters; it is used verbatim for both the INSERT and the value
+    returned to the API, which makes the 'create then immediately configure
+    delivery window' sequence use one identical identifier end to end.
+    """
+    return uuid.uuid4().hex[:_SUBSCRIPTION_ID_LEN]
 
 
 def _refill_tokens(
@@ -172,7 +225,27 @@ class Database:
     ):
         self._breaker_threshold = breaker_failure_threshold
         self._breaker_cooldown = breaker_cooldown_seconds
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # isolation_level=None puts the connection in SQLite autocommit mode:
+        # the driver never opens an implicit transaction behind our back, so
+        # *every* transaction boundary is one we state explicitly
+        # (_immediate() / claim_due_task()). Two guarantees follow from this:
+        #
+        # 1. Transaction visibility is uniform across subscription creation,
+        #    lookup and delivery-window read/write. A write committed by
+        #    create_subscription() is visible to the very next read on this
+        #    connection -- a read-only SELECT cannot stay pinned inside an
+        #    implicitly-opened snapshot that predates the INSERT, so a
+        #    freshly returned id is never mistaken for 'not found' by a
+        #    subsequent set_delivery_window()/get_delivery_window().
+        # 2. Explicit 'BEGIN IMMEDIATE' can never collide with an implicit
+        #    transaction the driver started for a previous statement, which
+        #    makes the BEGIN IMMEDIATE / BEGIN / COMMIT / ROLLBACK statements
+        #    in this module behave identically on every sqlite3/Python build
+        #    (the legacy transaction mode changed semantics across CPython
+        #    3.12.x patch releases).
+        self._conn = sqlite3.connect(
+            path, check_same_thread=False, isolation_level=None
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -182,6 +255,11 @@ class Database:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._lock = threading.Lock()
         with self._lock:
+            # In autocommit mode each CREATE TABLE IF NOT EXISTS statement is
+            # a one-statement transaction on its own; the migration's ALTERs
+            # run the same way, and the explicit table rebuild keeps its own
+            # BEGIN/COMMIT. The trailing commit is a harmless no-op kept for
+            # symmetry with the old implicit-transaction lifecycle.
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -359,32 +437,31 @@ class Database:
     # subscriptions
     # ------------------------------------------------------------------
     def create_subscription(self, target_url: str, secret: str) -> dict:
-        sub_id = uuid.uuid4().hex[:12]
+        """Insert a subscription and return its persisted row.
+
+        The row handed back is read straight back out of the committing
+        transaction via the same column projection every lookup uses
+        (_SUB_COLUMNS), so the returned id and the id later resolved by
+        get_subscription()/set_delivery_window()/get_delivery_window() are
+        guaranteed to be the same committed identity -- a caller that
+        immediately configures a delivery window with the returned id cannot
+        hit a 'not found' from a stale or diverged snapshot.
+        """
+        sub_id = new_subscription_id()
         now = time.time()
         with self._lock, self._immediate():
             self._conn.execute(
                 "INSERT INTO subscriptions (id, target_url, secret, created_at) VALUES (?, ?, ?, ?)",
                 (sub_id, target_url, secret, now),
             )
-        return {
-            "id": sub_id,
-            "target_url": target_url,
-            "created_at": now,
-            "paused_at": None,
-            "previous_secret_expires_at": None,
-            "breaker_state": "closed",
-            "breaker_consecutive_failures": 0,
-            "breaker_next_probe_at": None,
-            "rate_capacity": None,
-            "rate_refill_per_second": None,
-            "rate_tokens": None,
-            "rate_updated_at": None,
-            "window_timezone": None,
-            "window_weekdays": None,
-            "window_local_start": None,
-            "window_local_end": None,
-            "window_updated_at": None,
-        }
+            # Re-read within the same transaction so the returned view is the
+            # authoritative persisted row (same identity/columns as every
+            # later read) rather than a hand-assembled dict that could drift.
+            row = self._conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+        return dict(row)
 
     def list_subscriptions(self) -> list[dict]:
         with self._lock:
@@ -602,10 +679,13 @@ class Database:
         ordered = sorted(set(weekdays))
         encoded = json.dumps(ordered, separators=(",", ":"))
         with self._lock, self._immediate():
-            row = self._conn.execute(
+            # Same identity check every subscription write uses; the id here
+            # is the exact string minted by create_subscription and returned
+            # by POST /subscriptions.
+            exists = self._conn.execute(
                 "SELECT 1 FROM subscriptions WHERE id = ?", (sub_id,)
             ).fetchone()
-            if row is None:
+            if exists is None:
                 return None
             self._conn.execute(
                 """UPDATE subscriptions
@@ -615,13 +695,16 @@ class Database:
                     WHERE id = ?""",
                 (timezone, encoded, local_start, local_end, now, sub_id),
             )
-        return {
-            "timezone": timezone,
-            "weekdays": ordered,
-            "local_start": local_start,
-            "local_end": local_end,
-            "updated_at": now,
-        }
+            # Return the row exactly as persisted (re-read inside the same
+            # transaction, identical projection to get_delivery_window), so
+            # the PUT response is the committed configuration and needs no
+            # second lookup that could observe a different view.
+            row = self._conn.execute(
+                f"""SELECT {_WINDOW_COLUMNS}
+                      FROM subscriptions WHERE id = ?""",
+                (sub_id,),
+            ).fetchone()
+        return _window_row_to_policy(row)
 
     def get_delivery_window(self, sub_id: str) -> dict | None:
         """Return a subscription's stored delivery-window configuration.
@@ -632,30 +715,13 @@ class Database:
         """
         with self._lock:
             row = self._conn.execute(
-                """SELECT window_timezone, window_weekdays, window_local_start,
-                          window_local_end, window_updated_at
-                     FROM subscriptions WHERE id = ?""",
+                f"""SELECT {_WINDOW_COLUMNS}
+                      FROM subscriptions WHERE id = ?""",
                 (sub_id,),
             ).fetchone()
         if row is None:
             return None
-        if row["window_timezone"] is None:
-            return {
-                "configured": False,
-                "timezone": None,
-                "weekdays": None,
-                "local_start": None,
-                "local_end": None,
-                "updated_at": None,
-            }
-        return {
-            "configured": True,
-            "timezone": row["window_timezone"],
-            "weekdays": json.loads(row["window_weekdays"]),
-            "local_start": row["window_local_start"],
-            "local_end": row["window_local_end"],
-            "updated_at": row["window_updated_at"],
-        }
+        return _window_row_to_policy(row)
 
     def delete_delivery_window(self, sub_id: str) -> bool:
         """Remove a subscription's delivery window (deliveries unrestricted).

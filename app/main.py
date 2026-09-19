@@ -364,12 +364,14 @@ def put_delivery_window(sub_id: str, body: DeliveryWindowCreate) -> dict:
     )
     if stored is None:
         raise HTTPException(404, f"subscription {sub_id!r} not found")
-    policy = app.state.db.get_delivery_window(sub_id)
     log.info(
         "subscription %s delivery window set: zone=%s weekdays=%s %s-%s",
         sub_id, body.timezone, body.weekdays, body.local_start, body.local_end,
     )
-    return _delivery_window_out(time.time(), policy)
+    # Serialize the row re-read inside the committing write transaction:
+    # this is the same committed configuration a follow-up GET returns, so a
+    # create -> PUT -> GET chain always observes one persisted window.
+    return _delivery_window_out(time.time(), stored)
 
 
 @app.get("/subscriptions/{sub_id}/delivery-window", response_model=DeliveryWindowOut)
