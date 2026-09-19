@@ -359,12 +359,14 @@ def put_delivery_window(sub_id: str, body: DeliveryWindowCreate) -> dict:
     """
     start = parse_clock(body.local_start)
     end = parse_clock(body.local_end)
-    stored = app.state.db.set_delivery_window(
+    # The write returns the persisted policy read back in its own
+    # transaction, so the response is the exact stored configuration the
+    # following GET will observe -- no separate lookup in between.
+    policy = app.state.db.set_delivery_window(
         sub_id, body.timezone, body.weekdays, start, end
     )
-    if stored is None:
+    if policy is None:
         raise HTTPException(404, f"subscription {sub_id!r} not found")
-    policy = app.state.db.get_delivery_window(sub_id)
     log.info(
         "subscription %s delivery window set: zone=%s weekdays=%s %s-%s",
         sub_id, body.timezone, body.weekdays, body.local_start, body.local_end,

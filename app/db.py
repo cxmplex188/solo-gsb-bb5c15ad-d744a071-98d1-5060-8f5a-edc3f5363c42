@@ -163,6 +163,32 @@ def _window_from_row(row) -> DeliveryWindow | None:
         return None
 
 
+def _window_policy_from_row(row) -> dict:
+    """Serialize a subscription row's window columns into the policy dict.
+
+    Single canonical mapping shared by every read/write path, so a freshly
+    installed window and a subsequent GET always describe the same stored
+    state. A row with no window columns set answers ``configured=False``.
+    """
+    if row["window_timezone"] is None:
+        return {
+            "configured": False,
+            "timezone": None,
+            "weekdays": None,
+            "local_start": None,
+            "local_end": None,
+            "updated_at": None,
+        }
+    return {
+        "configured": True,
+        "timezone": row["window_timezone"],
+        "weekdays": json.loads(row["window_weekdays"]),
+        "local_start": row["window_local_start"],
+        "local_end": row["window_local_end"],
+        "updated_at": row["window_updated_at"],
+    }
+
+
 class Database:
     def __init__(
         self,
@@ -180,7 +206,10 @@ class Database:
         # IMMEDIATE write lock can momentarily be held by another connection;
         # wait for it instead of failing instantly with SQLITE_BUSY.
         self._conn.execute("PRAGMA busy_timeout=5000")
-        self._lock = threading.Lock()
+        # Reentrant: every create/lookup/policy path goes through one set of
+        # canonical helpers while already holding the connection lock, so a
+        # method may call another (e.g. create -> get) without self-deadlock.
+        self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._migrate()
@@ -366,25 +395,16 @@ class Database:
                 "INSERT INTO subscriptions (id, target_url, secret, created_at) VALUES (?, ?, ?, ?)",
                 (sub_id, target_url, secret, now),
             )
-        return {
-            "id": sub_id,
-            "target_url": target_url,
-            "created_at": now,
-            "paused_at": None,
-            "previous_secret_expires_at": None,
-            "breaker_state": "closed",
-            "breaker_consecutive_failures": 0,
-            "breaker_next_probe_at": None,
-            "rate_capacity": None,
-            "rate_refill_per_second": None,
-            "rate_tokens": None,
-            "rate_updated_at": None,
-            "window_timezone": None,
-            "window_weekdays": None,
-            "window_local_start": None,
-            "window_local_end": None,
-            "window_updated_at": None,
-        }
+            # Return the row as stored, reselected by its primary key inside
+            # the creating transaction: this is the exact identity every
+            # subsequent lookup (get/window/rate/topics) reads by, so the id
+            # POST returns cannot differ from the row the configure chain
+            # finds once the commit lands.
+            row = self._conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+        return dict(row)
 
     def list_subscriptions(self) -> list[dict]:
         with self._lock:
@@ -594,9 +614,13 @@ class Database:
         meet the new window on their next claim attempt -- a due head task
         found outside the window is deterministically pushed to the next
         opening inside the claim's critical section, and a task scheduled
-        further out is judged by the new window when it wakes. Returns the
-        stored window row fields, or None when the subscription does not
-        exist.
+        further out is judged by the new window when it wakes.
+
+        The stored window is read back by primary key inside this same
+        transaction and returned as the canonical policy dict, so the write
+        and the response (and any later GET) share one persisted view with no
+        separate read-after-write transaction in between. Returns None when
+        the subscription does not exist (nothing is written in that case).
         """
         now = time.time()
         ordered = sorted(set(weekdays))
@@ -615,13 +639,12 @@ class Database:
                     WHERE id = ?""",
                 (timezone, encoded, local_start, local_end, now, sub_id),
             )
-        return {
-            "timezone": timezone,
-            "weekdays": ordered,
-            "local_start": local_start,
-            "local_end": local_end,
-            "updated_at": now,
-        }
+            stored = self._conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+            policy = _window_policy_from_row(stored)
+        return policy
 
     def get_delivery_window(self, sub_id: str) -> dict | None:
         """Return a subscription's stored delivery-window configuration.
@@ -632,30 +655,12 @@ class Database:
         """
         with self._lock:
             row = self._conn.execute(
-                """SELECT window_timezone, window_weekdays, window_local_start,
-                          window_local_end, window_updated_at
-                     FROM subscriptions WHERE id = ?""",
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
                 (sub_id,),
             ).fetchone()
         if row is None:
             return None
-        if row["window_timezone"] is None:
-            return {
-                "configured": False,
-                "timezone": None,
-                "weekdays": None,
-                "local_start": None,
-                "local_end": None,
-                "updated_at": None,
-            }
-        return {
-            "configured": True,
-            "timezone": row["window_timezone"],
-            "weekdays": json.loads(row["window_weekdays"]),
-            "local_start": row["window_local_start"],
-            "local_end": row["window_local_end"],
-            "updated_at": row["window_updated_at"],
-        }
+        return _window_policy_from_row(row)
 
     def delete_delivery_window(self, sub_id: str) -> bool:
         """Remove a subscription's delivery window (deliveries unrestricted).
